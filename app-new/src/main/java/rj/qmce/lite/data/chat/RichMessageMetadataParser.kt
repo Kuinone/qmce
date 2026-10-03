@@ -175,7 +175,9 @@ object RichMessageMetadataParser {
         obj.optJSONArray("items")?.let { items ->
             val parts = ArrayList<String>()
             for (i in 0 until items.length()) {
-                (items.optJSONObject(i)?.optString("txt")?.trim()).takeIf(String::isNotBlank)?.let(parts::add)
+                items.optJSONObject(i)?.optString("txt")?.trim()
+                    ?.takeIf { it.isNotBlank() }
+                    ?.let(parts::add)
             }
             if (parts.isNotEmpty()) {
                 return parts.joinToString("").trim().takeIf(String::isNotBlank)
