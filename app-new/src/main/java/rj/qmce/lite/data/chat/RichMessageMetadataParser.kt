@@ -13,6 +13,14 @@ object RichMessageMetadataParser {
     // must be exactly the name holder so well-formed `<qquin uin="123">` is not matched.
     private val LEGACY_NAME_ATTR_REGEX = Regex("""^(?:qquin|uin)="([^"]*)"\s*$""")
 
+    // Attribute-borne copy used when a gray-tip tag carries its sentence as an
+    // attribute value instead of text nodes, e.g. <tip content="…"/>.
+    private val ATTR_TEXT_REGEX = Regex("""(?:content|text|tip|brief|title|msg|summary)\s*=\s*"([^"]*)"""")
+
+    // Upper bound for the grey-tip text rendered on the round Wear screen, so a
+    // long structured tip doesn't blow up the grey cell layout.
+    private const val SYSTEM_TIP_MAX_LENGTH = 140
+
     data class CardMetadata(
         val title: String,
         val description: String,
@@ -99,20 +107,13 @@ object RichMessageMetadataParser {
     fun parseSystemTip(raw: String?): String {
         if (raw.isNullOrBlank()) return "系统消息"
         val fields = raw.readXmlFields(setOf("title", "brief", "summary"))
-        fields["title"]?.takeIf(String::isNotBlank)?.let { return it }
-        fields["brief"]?.takeIf(String::isNotBlank)?.let { return it }
-
-        // Group gray-tip content such as "XX邀请XX加入了群聊" is shipped as
-        // old-style markup (<gtip align="center">…<qquin=..><username>…</username>…).
-        // Concatenate the visible text nodes so we show "XX邀请XX加入了群聊" instead of the raw HTML.
-        raw.extractXmlText()?.let { return it }
-
-        // Newer JSON gray tips carry the readable sentence in text/txt fields.
-        raw.extractJsonText()?.let { return it }
-
-        return raw.stripHtmlTags().take(140).replace(Regex("\\s+"), " ").trim()
-            .takeIf(String::isNotBlank)
-            ?: "系统消息"
+        // Single candidate, truncated once at the exit so every path is bounded.
+        val candidate = fields["title"]?.takeIf(String::isNotBlank)
+            ?: fields["brief"]?.takeIf(String::isNotBlank)
+            ?: raw.extractXmlText()
+            ?: raw.extractJsonText()
+            ?: raw.stripHtmlTags().takeIf(String::isNotBlank)
+        return candidate?.truncateForTip()?.takeIf(String::isNotBlank) ?: "系统消息"
     }
 
     /** Concatenates the character data of an HTML/XML snippet, e.g. `<gtip>..<qquin>..` → readable text. */
@@ -128,7 +129,8 @@ object RichMessageMetadataParser {
                 if (event == XmlPullParser.TEXT) sb.append(parser.text)
                 event = parser.next()
             }
-            sb.toString().decodeEntities().trim().takeIf(String::isNotBlank)?.let { return it }
+            sb.toString().decodeEntities().normalizeForTip()
+                .takeIf(String::isNotBlank)?.let { return it }
         }
         // Legacy pseudo-XML: names are stored inline as qquin="name" / uin="name"
         // (<gtip align="center"><qquin="张三">邀请…). Inline those values.
@@ -150,8 +152,20 @@ object RichMessageMetadataParser {
             LEGACY_NAME_ATTR_REGEX.find(tag)?.let { builder.append(it.groupValues[1]) }
             index = close + 1
         }
-        return builder.toString().decodeEntities().replace(Regex("\\s+"), " ").trim()
-            .takeIf(String::isNotBlank)
+        builder.toString().decodeEntities().normalizeForTip()
+            .takeIf(String::isNotBlank)?.let { return it }
+        // No text nodes found — fall back to attribute-borne copy (e.g. <tip content="…"/>)
+        // so the grey tip doesn't degrade to a bare "系统消息".
+        return extractXmlAttributeText()
+    }
+
+    /** Pulls the first readable value out of a tag's own attributes (content/text/tip/brief/…). */
+    private fun String.extractXmlAttributeText(): String? {
+        for (m in ATTR_TEXT_REGEX.findAll(this)) {
+            m.groupValues[1].trim().decodeEntities().normalizeForTip()
+                .takeIf(String::isNotBlank)?.let { return it }
+        }
+        return null
     }
 
     /** Pulls a readable sentence out of a JSON gray-tip payload. */
@@ -172,15 +186,20 @@ object RichMessageMetadataParser {
     }
 
     private fun String.stripHtmlTags(): String =
-        replace(Regex("<[^>]*>"), "").decodeEntities().replace(Regex("\\s+"), " ").trim()
+        replace(Regex("<[^>]*>"), "").decodeEntities().normalizeForTip()
+
+    private fun String.normalizeForTip(): String =
+        replace(Regex("\\s+"), " ").trim()
+
+    private fun String.truncateForTip(): String = normalizeForTip().take(SYSTEM_TIP_MAX_LENGTH)
 
     private fun String.decodeEntities(): String =
-        replace("&amp;", "&")
-            .replace("&lt;", "<")
+        replace("&lt;", "<")
             .replace("&gt;", ">")
             .replace("&quot;", "\"")
             .replace("&#39;", "'")
             .replace("&nbsp;", " ")
+            .replace("&amp;", "&")
 
     private fun JSONObject.collectMetaFields(depth: Int = 0): List<Pair<String, String>> {
         if (depth > 6) return emptyList()
